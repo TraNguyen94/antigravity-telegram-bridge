@@ -625,11 +625,11 @@ async def inject_and_send(prompt, image_paths=None):
                     if data.get("id") == cid:
                         return data
 
-            # 1. Attach image(s) if provided
+            # 1. Nạp ảnh vào IDE nếu có
             if image_paths:
                 valid_paths = [os.path.abspath(p) for p in image_paths if os.path.exists(p)]
                 if valid_paths:
-                    logger.info(f"Attaching {len(valid_paths)} image(s) to Antigravity: {valid_paths}")
+                    logger.info(f"Đang đính kèm {len(valid_paths)} ảnh vào Antigravity: {valid_paths}")
                     await cdp_call("DOM.enable")
                     doc = await cdp_call("DOM.getDocument")
                     root_id = doc.get("result", {}).get("root", {}).get("nodeId", 1)
@@ -657,55 +657,70 @@ async def inject_and_send(prompt, image_paths=None):
                             "expression": dispatch_expr,
                             "returnByValue": True
                         })
-                        await asyncio.sleep(0.8)
+                        await asyncio.sleep(1.0)
 
-            # 2. Inject text prompt and send
-            prompt_json = json.dumps(prompt or "")
-            expr = f"""
-            (() => {{
+            # Nếu gửi ảnh nhưng không kèm văn bản, tự động đặt lời nhắc mặc định
+            if not prompt and image_paths:
+                prompt = "Hãy phân tích và xử lý hình ảnh đính kèm này."
+
+            # 2. Focus ô nhập và đưa văn bản lên khung chat IDE
+            focus_expr = """
+            (() => {
                 const input = document.querySelector('[aria-label="Message input"]');
-                if (!input) return {{ ok: false, error: "Không tìm thấy ô nhập tin nhắn Antigravity" }};
-                
+                if (!input) return false;
                 input.focus();
                 document.execCommand('selectAll', false, null);
                 document.execCommand('delete', false, null);
-                
-                const text = {prompt_json};
-                if (text) {{
-                    const ok = document.execCommand('insertText', false, text);
-                    if (!ok) {{
-                        input.textContent = text;
-                        input.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    }}
-                }}
-                
-                const sendBtn = document.querySelector('button[aria-label="Send message"]');
-                if (sendBtn && !sendBtn.disabled) {{
-                    sendBtn.click();
-                    return {{ ok: true, method: "button_click" }};
-                }}
-                
-                const eventDown = new KeyboardEvent('keydown', {{
-                    bubbles: true,
-                    cancelable: true,
-                    key: 'Enter',
-                    code: 'Enter',
-                    keyCode: 13,
-                    which: 13
-                }});
-                input.dispatchEvent(eventDown);
-                
-                return {{ ok: true, method: "enter_key" }};
-            }})()
+                return true;
+            })()
             """
-            eval_res = await cdp_call("Runtime.evaluate", {
-                "expression": expr,
-                "returnByValue": True
-            })
-            val = eval_res.get("result", {}).get("result", {}).get("value")
-            if isinstance(val, dict) and val.get("ok"):
-                return True, None
-            return False, str(val)
+            f_res = await cdp_call("Runtime.evaluate", {"expression": focus_expr, "returnByValue": True})
+            if not f_res.get("result", {}).get("result", {}).get("value"):
+                return False, "Không tìm thấy ô nhập tin nhắn Antigravity IDE"
+                
+            await asyncio.sleep(0.1)
+
+            # Sử dụng CDP Input.insertText để văn bản hiện lên màn hình IDE như gõ phím thật
+            if prompt:
+                await cdp_call("Input.insertText", {"text": prompt})
+                await asyncio.sleep(0.3)
+
+            # 3. Kích hoạt gửi (Sent luôn)
+            # Thử click nút Gửi của Antigravity (data-tooltip-id chứa input-send-button)
+            click_expr = """
+            (() => {
+                const btn = document.querySelector('button[data-tooltip-id*="input-send-button"]:not([aria-label*="Cancel"])') ||
+                            document.querySelector('button[aria-label="Send message"]') ||
+                            document.querySelector('button[data-tooltip-id*="send"]') ||
+                            document.querySelector('button[type="submit"]');
+                if (btn && !btn.disabled) {
+                    btn.click();
+                    return { ok: true, method: "button_click" };
+                }
+                return { ok: false };
+            })()
+            """
+            click_res = await cdp_call("Runtime.evaluate", {"expression": click_expr, "returnByValue": True})
+            val = click_res.get("result", {}).get("result", {}).get("value")
+
+            # Fallback: Nhấn Enter vật lý qua CDP nếu nút gửi chưa kích hoạt
+            if not (isinstance(val, dict) and val.get("ok")):
+                await cdp_call("Input.dispatchKeyEvent", {
+                    "type": "rawKeyDown",
+                    "windowsVirtualKeyCode": 13,
+                    "unmodifiedText": "\r",
+                    "text": "\r",
+                    "key": "Enter",
+                    "code": "Enter"
+                })
+                await cdp_call("Input.dispatchKeyEvent", {
+                    "type": "keyUp",
+                    "windowsVirtualKeyCode": 13,
+                    "key": "Enter",
+                    "code": "Enter"
+                })
+                
+            return True, None
 
     except Exception as e:
         logger.error(f"Error in inject_and_send: {e}", exc_info=True)
