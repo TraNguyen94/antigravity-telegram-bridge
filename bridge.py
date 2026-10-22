@@ -3,9 +3,11 @@ import glob
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -29,7 +31,6 @@ logger = logging.getLogger("AntigravityBridge")
 CDP_LIST_URL = f"http://127.0.0.1:{config.DEFAULT_CDP_PORT}/json/list"
 message_queue = asyncio.Queue()
 user_nav_context = {}
-user_upgrade_states = {}
 
 # -------------------------------------------------------------
 # Telegram Messaging Helpers
@@ -109,9 +110,48 @@ def download_telegram_file(file_id, dest_dir=config.RECEIVED_IMAGES_DIR):
 # -------------------------------------------------------------
 # Antigravity DevTools (CDP) Auto-Detection & Control
 # -------------------------------------------------------------
+def get_devtools_active_port():
+    """Đọc chính xác cổng DevTools do Chromium cấp phát ngẫu nhiên từ file DevToolsActivePort."""
+    paths = []
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            paths.append(Path(appdata) / "Antigravity" / "DevToolsActivePort")
+    elif sys.platform == "darwin":
+        paths.append(Path.home() / "Library" / "Application Support" / "Antigravity" / "DevToolsActivePort")
+    else:
+        paths.append(Path.home() / ".config" / "Antigravity" / "DevToolsActivePort")
+        
+    for p in paths:
+        if p.exists():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    lines = [line.strip() for line in f if line.strip()]
+                    if lines and lines[0].isdigit():
+                        return int(lines[0])
+            except Exception:
+                pass
+    return None
+
 def detect_cdp_url():
-    """Tự động dò cổng DevTools (CDP) của Antigravity IDE khi mở lại cổng mới."""
+    """Tự động dò cổng DevTools (CDP) của Antigravity IDE."""
     global CDP_LIST_URL
+    
+    # 1. Thử đọc file DevToolsActivePort (Chính xác 100%)
+    active_port = get_devtools_active_port()
+    if active_port:
+        url = f"http://127.0.0.1:{active_port}/json/list"
+        try:
+            req = urllib.request.Request(url, timeout=1.5)
+            tabs = json.loads(req.read().decode())
+            if isinstance(tabs, list) and any("webSocketDebuggerUrl" in t for t in tabs):
+                CDP_LIST_URL = url
+                logger.info(f"Connected to Antigravity port via DevToolsActivePort: {active_port}")
+                return url
+        except Exception:
+            pass
+
+    # 2. Thử các cổng quen thuộc
     cached_ports = [config.DEFAULT_CDP_PORT, 57061, 50717, 9222]
     for port in cached_ports:
         try:
@@ -124,7 +164,7 @@ def detect_cdp_url():
         except Exception:
             pass
 
-    # Windows: Auto-detect listening ports on 127.0.0.1
+    # 3. Quét mạng trên Windows nếu cần
     if sys.platform == "win32":
         try:
             import subprocess
@@ -137,14 +177,14 @@ def detect_cdp_url():
                 if not line.isdigit():
                     continue
                 port = int(line)
-                if port in cached_ports:
+                if port in cached_ports or port == active_port:
                     continue
                 try:
                     url = f"http://127.0.0.1:{port}/json/list"
                     req = urllib.request.Request(url, timeout=0.8)
                     tabs = json.loads(req.read().decode())
                     if isinstance(tabs, list) and any("webSocketDebuggerUrl" in t for t in tabs):
-                        logger.info(f"Auto-detected Antigravity CDP port: {port}")
+                        logger.info(f"Auto-detected Antigravity CDP port via network scan: {port}")
                         CDP_LIST_URL = url
                         return url
                 except Exception:
@@ -705,6 +745,14 @@ async def wait_until_complete(chat_id, transcript_file, start_step, max_timeout=
 # -------------------------------------------------------------
 # Dynamic Top 5 Projects & Command Registration
 # -------------------------------------------------------------
+def clean_command_slug(text):
+    """Chuẩn hóa tên lệnh theo chuẩn Telegram: chỉ chấp nhận a-z, 0-9 và dấu gạch dưới."""
+    nfkd = unicodedata.normalize('NFKD', str(text))
+    ascii_text = nfkd.encode('ASCII', 'ignore').decode('utf-8')
+    cleaned = re.sub(r'[^a-zA-Z0-9_]', '_', ascii_text).strip('_').lower()
+    cleaned = re.sub(r'_+', '_', cleaned)
+    return cleaned or "proj"
+
 def get_top_5_projects():
     projects_map, _ = get_db_projects_and_conversations()
     recent_list = []
@@ -724,7 +772,8 @@ def register_telegram_commands():
         top5 = get_top_5_projects()
         commands = []
         for idx, p in enumerate(top5, 1):
-            cmd_name = f"p{idx}_{p['name'].replace(' ', '_').replace('-', '_')[:15]}".lower()
+            slug = clean_command_slug(p.get("name", ""))[:15]
+            cmd_name = f"p{idx}_{slug}"[:32]
             commands.append({
                 "command": cmd_name,
                 "description": f"📁 [{idx}/5] Dự án {p['name'][:25]}"
@@ -882,7 +931,7 @@ async def main():
     if tab:
         logger.info(f"Connected to Antigravity at {cdp_url}: {tab.get('title')}")
     else:
-        logger.warning(f"Could not connect to Antigravity at {cdp_url}. Will retry during operation.")
+        logger.warning(f"Could not connect to Antigravity at {cdp_url}. Please ensure Antigravity IDE is running.")
         
     # 2. Register Telegram slash commands
     register_telegram_commands()
@@ -968,6 +1017,13 @@ async def main():
 
         except asyncio.CancelledError:
             break
+        except urllib.error.HTTPError as he:
+            if he.code == 409:
+                logger.error("HTTP 409 Conflict: Bot token này đang chạy ở một cửa sổ hoặc máy tính khác! Vui lòng chỉ mở 1 bot tại 1 thời điểm.")
+                await asyncio.sleep(6)
+            else:
+                logger.error(f"Polling loop HTTP error ({he.code}): {he}")
+                await asyncio.sleep(2)
         except Exception as e:
             logger.error(f"Polling loop error: {e}")
             await asyncio.sleep(2)
