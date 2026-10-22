@@ -22,7 +22,7 @@ RECEIVED_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8884877895:AAFUpGHMul8wLTVIA7ioYZePYZAiROooPxk")
 
 # Allowed Telegram User IDs (comma separated string -> set of ints)
-raw_users = os.getenv("ALLOWED_USER_IDS", os.getenv("ALLOWED_USER_ID", "5889330916"))
+raw_users = os.getenv("ALLOWED_USER_IDS", os.getenv("ALLOWED_USER_ID", "5889330916,8353584732"))
 ALLOWED_USER_IDS = set()
 for uid in str(raw_users).split(","):
     uid = uid.strip()
