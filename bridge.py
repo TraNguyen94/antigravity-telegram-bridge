@@ -142,8 +142,8 @@ def detect_cdp_url():
     if active_port:
         url = f"http://127.0.0.1:{active_port}/json/list"
         try:
-            req = urllib.request.Request(url, timeout=1.5)
-            tabs = json.loads(req.read().decode())
+            with urllib.request.urlopen(url, timeout=1.5) as resp:
+                tabs = json.loads(resp.read().decode())
             if isinstance(tabs, list) and any("webSocketDebuggerUrl" in t for t in tabs):
                 CDP_LIST_URL = url
                 logger.info(f"Connected to Antigravity port via DevToolsActivePort: {active_port}")
@@ -156,8 +156,8 @@ def detect_cdp_url():
     for port in cached_ports:
         try:
             url = f"http://127.0.0.1:{port}/json/list"
-            req = urllib.request.Request(url, timeout=1)
-            tabs = json.loads(req.read().decode())
+            with urllib.request.urlopen(url, timeout=1) as resp:
+                tabs = json.loads(resp.read().decode())
             if isinstance(tabs, list) and any("webSocketDebuggerUrl" in t for t in tabs):
                 CDP_LIST_URL = url
                 return url
@@ -169,8 +169,8 @@ def detect_cdp_url():
         try:
             import subprocess
             out = subprocess.check_output(
-                'powershell -NoProfile -Command "Get-NetTCPConnection -State Listen | Where-Object { $_.LocalAddress -eq \'127.0.0.1\' } | Select-Object -ExpandProperty LocalPort"',
-                shell=True, text=True, timeout=5
+                ["powershell", "-NoProfile", "-Command", "Get-NetTCPConnection -State Listen -LocalAddress 127.0.0.1 | Select-Object -ExpandProperty LocalPort"],
+                text=True, timeout=5
             )
             for line in out.splitlines():
                 line = line.strip()
@@ -181,8 +181,8 @@ def detect_cdp_url():
                     continue
                 try:
                     url = f"http://127.0.0.1:{port}/json/list"
-                    req = urllib.request.Request(url, timeout=0.8)
-                    tabs = json.loads(req.read().decode())
+                    with urllib.request.urlopen(url, timeout=0.8) as resp:
+                        tabs = json.loads(resp.read().decode())
                     if isinstance(tabs, list) and any("webSocketDebuggerUrl" in t for t in tabs):
                         logger.info(f"Auto-detected Antigravity CDP port via network scan: {port}")
                         CDP_LIST_URL = url
@@ -686,13 +686,12 @@ async def inject_and_send(prompt, image_paths=None):
                 await asyncio.sleep(0.3)
 
             # 3. Kích hoạt gửi (Sent luôn)
-            # Thử click nút Gửi của Antigravity (data-tooltip-id chứa input-send-button)
+            # Click đúng nút Gửi của Antigravity (data-testid="send-button" hoặc input-send-button-send-tooltip)
             click_expr = """
             (() => {
-                const btn = document.querySelector('button[data-tooltip-id*="input-send-button"]:not([aria-label*="Cancel"])') ||
-                            document.querySelector('button[aria-label="Send message"]') ||
-                            document.querySelector('button[data-tooltip-id*="send"]') ||
-                            document.querySelector('button[type="submit"]');
+                const btn = document.querySelector('button[data-testid="send-button"]') ||
+                            document.querySelector('button[data-tooltip-id="input-send-button-send-tooltip"]') ||
+                            document.querySelector('button[aria-label="Send message"]');
                 if (btn && !btn.disabled) {
                     btn.click();
                     return { ok: true, method: "button_click" };
