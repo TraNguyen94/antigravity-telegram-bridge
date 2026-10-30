@@ -1,17 +1,25 @@
 import asyncio
+import ctypes
+from ctypes import wintypes
+import datetime
 import glob
 import json
 import logging
 import os
+from pathlib import Path
 import re
+import socket
 import sqlite3
+import subprocess
 import sys
 import time
 import unicodedata
 import urllib.parse
 import urllib.request
-from datetime import datetime
-from pathlib import Path
+
+from PIL import Image
+import psutil
+import requests
 import websockets
 
 import config
@@ -64,6 +72,30 @@ def send_telegram(chat_id, text, reply_to_id=None, reply_markup=None):
         except Exception as e:
             logger.error(f"Error sending message to Telegram: {e}")
 
+def send_telegram_photo(chat_id, photo_path, caption=None, reply_to_id=None):
+    url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendPhoto"
+    data = {"chat_id": chat_id}
+    if caption:
+        data["caption"] = caption[:1024]
+        data["parse_mode"] = "Markdown"
+    if reply_to_id:
+        data["reply_to_message_id"] = reply_to_id
+    try:
+        with open(photo_path, "rb") as f:
+            files = {"photo": f}
+            resp = requests.post(url, data=data, files=files, timeout=30)
+            res_json = resp.json()
+            if not res_json.get("ok"):
+                # Fallback without markdown
+                data.pop("parse_mode", None)
+                f.seek(0)
+                resp = requests.post(url, data=data, files={"photo": f}, timeout=30)
+                res_json = resp.json()
+            return res_json
+    except Exception as e:
+        logger.error(f"Error sending photo to Telegram: {e}")
+        return None
+
 def answer_callback_query(cb_id, text=None, show_alert=False):
     url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/answerCallbackQuery"
     payload = {"callback_query_id": cb_id}
@@ -96,7 +128,6 @@ def download_telegram_file(file_id, dest_dir=config.RECEIVED_IMAGES_DIR):
     if not data.get("ok"):
         raise Exception(f"Không thể lấy thông tin file từ Telegram: {data}")
     remote_path = data["result"]["file_path"]
-    ext = os.path.splitext(remote_path)[1] or ".jpg"
     filename = f"tg_{int(time.time())}_{os.path.basename(remote_path)}"
     local_path = os.path.join(dest_dir, filename)
     
@@ -106,6 +137,138 @@ def download_telegram_file(file_id, dest_dir=config.RECEIVED_IMAGES_DIR):
         f.write(r.read())
     logger.info(f"Downloaded Telegram photo to {local_path} ({os.path.getsize(local_path)} bytes)")
     return local_path
+
+# -------------------------------------------------------------
+# Native Windows Screen Capture & Hardware Management
+# -------------------------------------------------------------
+def capture_screen_gdi(output_path):
+    """Chụp ảnh màn hình Desktop Windows bằng Win32 GDI BitBlt siêu nhanh và sắc nét."""
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+
+    width = user32.GetSystemMetrics(0)   # SM_CXSCREEN
+    height = user32.GetSystemMetrics(1)  # SM_CYSCREEN
+
+    hdesktop = user32.GetDesktopWindow()
+    desktop_dc = user32.GetDC(hdesktop)
+    mem_dc = gdi32.CreateCompatibleDC(desktop_dc)
+    bitmap = gdi32.CreateCompatibleBitmap(desktop_dc, width, height)
+    old_bitmap = gdi32.SelectObject(mem_dc, bitmap)
+
+    # SRCCOPY = 0x00CC0020, CAPTUREBLT = 0x40000000
+    gdi32.BitBlt(mem_dc, 0, 0, width, height, desktop_dc, 0, 0, 0x00CC0020 | 0x40000000)
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [
+            ('biSize', wintypes.DWORD),
+            ('biWidth', wintypes.LONG),
+            ('biHeight', wintypes.LONG),
+            ('biPlanes', wintypes.WORD),
+            ('biBitCount', wintypes.WORD),
+            ('biCompression', wintypes.DWORD),
+            ('biSizeImage', wintypes.DWORD),
+            ('biXPelsPerMeter', wintypes.LONG),
+            ('biYPelsPerMeter', wintypes.LONG),
+            ('biClrUsed', wintypes.DWORD),
+            ('biClrImportant', wintypes.DWORD)
+        ]
+
+    bmi = BITMAPINFOHEADER()
+    bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bmi.biWidth = width
+    bmi.biHeight = -height
+    bmi.biPlanes = 1
+    bmi.biBitCount = 32
+    bmi.biCompression = 0
+
+    buffer_len = width * height * 4
+    buf = (ctypes.c_char * buffer_len)()
+
+    gdi32.GetDIBits(mem_dc, bitmap, 0, height, buf, ctypes.byref(bmi), 0)
+
+    gdi32.SelectObject(mem_dc, old_bitmap)
+    gdi32.DeleteObject(bitmap)
+    gdi32.DeleteDC(mem_dc)
+    user32.ReleaseDC(hdesktop, desktop_dc)
+
+    img = Image.frombuffer('RGBA', (width, height), buf, 'raw', 'BGRA', 0, 1).convert('RGB')
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    img.save(output_path, 'JPEG', quality=85)
+    return width, height
+
+def get_system_hardware_info():
+    """Thu thập thông số phần cứng thực tế của PC."""
+    cpu = psutil.cpu_percent(interval=0.4)
+    cores = psutil.cpu_count(logical=True)
+    mem = psutil.virtual_memory()
+    
+    disks_info = []
+    for part in psutil.disk_partitions(all=False):
+        if 'cdrom' in part.opts or not part.fstype:
+            continue
+        try:
+            usage = psutil.disk_usage(part.mountpoint)
+            used_gb = round(usage.used / (1024**3), 1)
+            total_gb = round(usage.total / (1024**3), 1)
+            disks_info.append(f"  • `{part.device}` {used_gb}/{total_gb} GB ({usage.percent}%)")
+        except PermissionError:
+            pass
+            
+    boot_time = datetime.datetime.fromtimestamp(psutil.boot_time())
+    uptime = datetime.datetime.now() - boot_time
+    hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+    minutes, _ = divmod(remainder, 60)
+    
+    hostname = socket.gethostname()
+    try:
+        local_ip = socket.gethostbyname(hostname)
+    except Exception:
+        local_ip = "127.0.0.1"
+        
+    battery = psutil.sensors_battery()
+    bat_str = f"{battery.percent}% ({'Đang sạc 🔌' if battery.power_plugged else 'Dùng pin 🔋'})" if battery else "Nguồn điện PC cắm trực tiếp 🔌"
+    
+    mem_used_gb = round(mem.used / (1024**3), 2)
+    mem_total_gb = round(mem.total / (1024**3), 2)
+    
+    report = (
+        f"💻 *THÔNG SỐ HỆ THỐNG MÁY TÍNH (PC STATUS):*\n\n"
+        f"• *Tên máy:* `{hostname}` (`{local_ip}`)\n"
+        f"• *Thời gian mở máy (Uptime):* `{hours} giờ {minutes} phút`\n"
+        f"• *CPU:* `{cpu}%` ({cores} Cores/Threads)\n"
+        f"• *RAM:* `{mem_used_gb} GB / {mem_total_gb} GB` ({mem.percent}%)\n"
+        f"• *Pin / Nguồn:* {bat_str}\n"
+        f"• *Dung lượng ổ đĩa:*\n" + "\n".join(disks_info)
+    )
+    return report
+
+def lock_windows_workstation():
+    """Khóa màn hình máy tính Windows ngay lập tức."""
+    return ctypes.windll.user32.LockWorkStation() != 0
+
+def execute_system_cmd(command_str):
+    """Chạy lệnh PowerShell / CMD trực tiếp trên PC và trả stdout/stderr."""
+    try:
+        res = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command_str],
+            capture_output=True,
+            text=True,
+            timeout=35
+        )
+        out = (res.stdout or "").strip()
+        err = (res.stderr or "").strip()
+        if not out and not err:
+            return "✅ Lệnh đã thực thi thành công (Không có text xuất ra)."
+        combined = []
+        if out:
+            combined.append(f"📄 *STDOUT:*\n```text\n{out[:3500]}\n```")
+        if err:
+            combined.append(f"⚠️ *STDERR:*\n```text\n{err[:1000]}\n```")
+        return "\n\n".join(combined)
+    except subprocess.TimeoutExpired:
+        return "⚠️ Lệnh chạy quá thời gian chờ (Timeout 35s)."
+    except Exception as e:
+        return f"❌ Lỗi thực thi lệnh: {e}"
 
 # -------------------------------------------------------------
 # Antigravity DevTools (CDP) Auto-Detection & Control
@@ -152,7 +315,7 @@ def detect_cdp_url():
             pass
 
     # 2. Thử các cổng quen thuộc
-    cached_ports = [config.DEFAULT_CDP_PORT, 57061, 50717, 9222]
+    cached_ports = [config.DEFAULT_CDP_PORT, 52874, 49912, 57061, 50717, 9222]
     for port in cached_ports:
         try:
             url = f"http://127.0.0.1:{port}/json/list"
@@ -167,7 +330,6 @@ def detect_cdp_url():
     # 3. Quét mạng trên Windows nếu cần
     if sys.platform == "win32":
         try:
-            import subprocess
             out = subprocess.check_output(
                 ["powershell", "-NoProfile", "-Command", "Get-NetTCPConnection -State Listen -LocalAddress 127.0.0.1 | Select-Object -ExpandProperty LocalPort"],
                 text=True, timeout=5
@@ -268,12 +430,18 @@ async def stop_task():
 async def new_conversation():
     expr = """
     (() => {
+        const a = document.querySelector('a[href="/"]');
+        if (a) {
+            a.click();
+            return true;
+        }
         const btn = document.querySelector('button[aria-label="New Conversation"]');
         if (btn) {
             btn.click();
             return true;
         }
-        return false;
+        window.location.href = '/';
+        return true;
     })()
     """
     res, err = await cdp_eval(expr)
@@ -346,7 +514,7 @@ def get_db_projects_and_conversations():
                 if mtime:
                     try:
                         dt_part = mtime.split(".")[0].split("+")[0]
-                        dt = datetime.strptime(dt_part, "%Y-%m-%d %H:%M:%S")
+                        dt = datetime.datetime.strptime(dt_part, "%Y-%m-%d %H:%M:%S")
                         time_str = dt.strftime("%d/%m %H:%M")
                     except Exception:
                         time_str = mtime[:16]
@@ -395,7 +563,7 @@ def set_active_project(name, path):
     data = {
         "name": name,
         "path": path,
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
     try:
         with open(config.ACTIVE_PROJECT_FILE, "w", encoding="utf-8") as f:
@@ -686,7 +854,6 @@ async def inject_and_send(prompt, image_paths=None):
                 await asyncio.sleep(0.3)
 
             # 3. Kích hoạt gửi (Sent luôn)
-            # Click đúng nút Gửi của Antigravity (data-testid="send-button" hoặc input-send-button-send-tooltip)
             click_expr = """
             (() => {
                 const btn = document.querySelector('button[data-testid="send-button"]') ||
@@ -757,6 +924,106 @@ async def wait_until_complete(chat_id, transcript_file, start_step, max_timeout=
     return "⚠️ Quá thời gian chờ (timeout) 15 phút từ Antigravity."
 
 # -------------------------------------------------------------
+# Multi-command / Multi-Conversation Spawner
+# -------------------------------------------------------------
+def parse_multi_commands(text):
+    """
+    Phân tích chuỗi đầu vào thành nhiều lệnh độc lập.
+    Hỗ trợ phân cách bởi:
+    1. '---' hoặc '===' trên một dòng riêng.
+    2. Đánh số thứ tự (ví dụ: '1. ... \n2. ...') nếu có từ 2 mục trở lên.
+    """
+    # 1. Thử tách theo phân cách khối
+    lines = text.strip().splitlines()
+    blocks = []
+    current_block = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped in ["---", "===", "----", "===="] or (stripped.startswith("---") and len(stripped) >= 3 and set(stripped) == {'-'}):
+            if current_block:
+                blocks.append("\n".join(current_block).strip())
+                current_block = []
+        else:
+            current_block.append(line)
+    if current_block:
+        blocks.append("\n".join(current_block).strip())
+    blocks = [b for b in blocks if b]
+    if len(blocks) >= 2:
+        return blocks
+
+    # 2. Thử tách theo danh sách đánh số: 1. ... 2. ...
+    num_blocks = re.split(r'(?:^|\n)\s*(?:\d+[\.\)]|\[\d+\])\s+', text.strip())
+    num_blocks = [b.strip() for b in num_blocks if b.strip()]
+    if len(num_blocks) >= 2:
+        return num_blocks
+
+    return [text.strip()]
+
+async def execute_multi_conversations(chat_id, commands, msg_id):
+    """
+    Khởi tạo song song N đoạn hội thoại trên Antigravity IDE.
+    Mỗi lệnh sẽ được gửi vào một phiên chat mới độc lập.
+    """
+    total = len(commands)
+    send_telegram(
+        chat_id,
+        f"🚀 *BẮT ĐẦU MỞ SONG SONG {total} ĐOẠN HỘI THOẠI TRÊN ANTIGRAVITY IDE:*\n"
+        f"Hệ thống sẽ lần lượt tạo từng phiên chat mới và kích hoạt tác vụ chạy ngầm.",
+        msg_id
+    )
+
+    spawned = []
+    for idx, cmd_text in enumerate(commands, 1):
+        try:
+            send_telegram_chat_action(chat_id, "typing")
+            # 1. Mở cửa sổ chat mới trên IDE
+            await new_conversation()
+            await asyncio.sleep(1.8)
+
+            # 2. Bơm lệnh vào ô chat và gửi
+            ok, err = await inject_and_send(cmd_text)
+            if not ok:
+                send_telegram(chat_id, f"❌ [{idx}/{total}] Lỗi khi gửi lệnh vào IDE: {err}", msg_id)
+                continue
+
+            await asyncio.sleep(1.8)
+            new_cid = await get_current_conversation_id()
+            short_cmd = cmd_text.replace("\n", " ")[:60]
+            if len(cmd_text) > 60:
+                short_cmd += "..."
+
+            spawned.append({
+                "index": idx,
+                "cid": new_cid or "Chưa tạo xong",
+                "title": short_cmd
+            })
+
+            send_telegram(
+                chat_id,
+                f"✅ *[{idx}/{total}] Đã mở đoạn chat mới:*\n"
+                f"• *Nhiệm vụ:* _{short_cmd}_\n"
+                f"• *ID:* `{new_cid or 'Khởi tạo...'}`",
+                msg_id
+            )
+            await asyncio.sleep(1.0)
+        except Exception as e:
+            logger.error(f"Error spawning conversation {idx}: {e}")
+            send_telegram(chat_id, f"⚠️ [{idx}/{total}] Gặp lỗi: {e}", msg_id)
+
+    # Báo cáo tổng kết
+    summary_lines = [
+        f"🎉 *ĐÃ KHỞI TẠO XONG {len(spawned)}/{total} ĐOẠN HỘI THOẠI TRÊN IDE!*\n",
+        "Tất cả các tác vụ hiện đang được Antigravity xử lý đồng thời trong nền.\n"
+    ]
+    for s in spawned:
+        summary_lines.append(f"• *#{s['index']}*: `{s['title']}` (ID: `{s['cid'][:8] if s['cid'] else '...'}`)")
+
+    summary_lines.append(
+        "\n👉 *Mẹo*: Gõ `/chats` bất kỳ lúc nào để xem danh sách hoặc bấm nút chuyển đổi giữa các đoạn chat trên điện thoại!"
+    )
+    send_telegram(chat_id, "\n".join(summary_lines), msg_id)
+
+# -------------------------------------------------------------
 # Dynamic Top 5 Projects & Command Registration
 # -------------------------------------------------------------
 def clean_command_slug(text):
@@ -796,6 +1063,11 @@ def register_telegram_commands():
         commands.extend([
             {"command": "projects", "description": "📂 Danh sách tất cả dự án trên IDE"},
             {"command": "chats", "description": "💬 Danh sách & chọn đoạn chat gần đây"},
+            {"command": "multi", "description": "⚡ Mở nhiều đoạn chat song song cùng lúc"},
+            {"command": "screen", "description": "🖥️ Chụp màn hình Desktop PC thực tế"},
+            {"command": "sysinfo", "description": "💻 Xem CPU, RAM, Ổ cứng, Uptime PC"},
+            {"command": "lock", "description": "🔒 Khóa màn hình máy tính từ xa"},
+            {"command": "cmd", "description": "⚡ Chạy lệnh PowerShell trên PC"},
             {"command": "current", "description": "🔍 Xem dự án & đoạn chat đang mở"},
             {"command": "new", "description": "🆕 Mở đoạn chat mới trên IDE"},
             {"command": "stop", "description": "⏹️ Dừng khẩn cấp tác vụ đang chạy"},
@@ -824,13 +1096,19 @@ async def worker_loop():
             if cmd == "/start":
                 welcome = (
                     "👋 **Chào mừng bạn đến với Antigravity Direct Bridge!**\n\n"
-                    "✨ Kết nối **trực tiếp 100%** vào Antigravity IDE trên máy tính.\n\n"
-                    "📌 **Điều khiển Dự án & Đoạn chat:**\n"
-                    "• `/projects`: Xem danh sách tất cả Dự án & chọn đoạn chat\n"
-                    "• `/chats`: Xem nhanh tất cả đoạn chat gần đây (chuyển đổi 1 chạm)\n"
-                    "• `/current`: Xem đoạn chat & dự án đang mở trên IDE\n"
+                    "✨ Kết nối **trực tiếp 100%** vào Antigravity IDE & Hệ thống PC từ xa.\n\n"
+                    "📌 **Điều khiển Antigravity IDE:**\n"
+                    "• `/projects`: Danh sách Dự án & chọn đoạn chat\n"
+                    "• `/chats`: Danh sách đoạn chat gần đây (chuyển 1 chạm)\n"
+                    "• `/multi`: Mở nhiều đoạn chat song song cùng lúc\n"
+                    "• `/current`: Xem dự án & đoạn chat đang mở trên IDE\n"
                     "• `/new`: Mở đoạn chat mới trên Antigravity\n"
-                    "• `/stop`: Dừng khẩn cấp tác vụ đang chạy trên PC\n\n"
+                    "• `/stop`: Dừng khẩn cấp tác vụ đang chạy trên IDE\n\n"
+                    "🖥️ **Quản lý máy tính (PC Remote Control):**\n"
+                    "• `/screen`: Chụp ảnh màn hình Desktop PC gửi về Telegram\n"
+                    "• `/sysinfo`: Xem CPU, RAM, Ổ cứng, Uptime, IP của PC\n"
+                    "• `/lock`: Khóa màn hình máy tính Windows từ xa\n"
+                    "• `/cmd <lệnh>`: Chạy lệnh PowerShell trực tiếp trên PC\n\n"
                     "📸 **Gửi ảnh trực tiếp**: Chụp hoặc gửi ảnh bất kỳ, bot sẽ nạp ảnh ngay vào IDE kèm lời nhắn!"
                 )
                 send_telegram(chat_id, welcome, msg_id)
@@ -839,30 +1117,82 @@ async def worker_loop():
             # --- 2. Lệnh /help ---
             if cmd in ["/help", "help", "/huongdan", "huongdan", "hướng dẫn", "huong dan"]:
                 help_text = (
-                    "📖 **HƯỚNG DẪN ĐIỀU KHIỂN ANTIGRAVITY IDE QUA TELEGRAM**\n\n"
-                    "⚡ *Mẹo*: Khi gõ dấu `/`, Telegram sẽ tự động hiện danh sách dự án gần nhất để bạn chọn ngay!\n\n"
-                    "🛠️ **Lệnh điều khiển chung:**\n"
-                    "• `/projects`: Xem danh sách tất cả các dự án trên máy tính\n"
-                    "• `/chats`: Xem tất cả đoạn chat gần đây kèm tag dự án\n"
-                    "• `/current`: Xem màn hình & đoạn chat đang mở trên PC\n"
-                    "• `/new`: Mở phiên làm việc mới trên Antigravity IDE\n"
-                    "• `/stop`: Dừng khẩn cấp lệnh đang chạy trên PC\n"
+                    "📖 **HƯỚNG DẪN ĐIỀU KHIỂN ANTIGRAVITY & PC QUA TELEGRAM**\n\n"
+                    "⚡ *Mẹo*: Khi gõ dấu `/`, Telegram sẽ tự động hiện danh sách lệnh và dự án để chọn ngay!\n\n"
+                    "🛠️ **1. Điều khiển IDE:**\n"
+                    "• `/projects`: Xem danh sách tất cả các dự án\n"
+                    "• `/chats`: Xem tất cả đoạn chat gần đây\n"
+                    "• `/multi`: Mở nhiều đoạn chat song song cùng lúc\n"
+                    "  _Cú pháp_: Nhập các lệnh cách nhau bởi dòng `---`\n"
+                    "• `/current`: Xem đoạn chat & dự án đang mở\n"
+                    "• `/new`: Mở phiên làm việc mới trên IDE\n"
+                    "• `/stop`: Dừng khẩn cấp lệnh đang chạy trên PC\n\n"
+                    "💻 **2. Quản lý phần cứng PC:**\n"
+                    "• `/screen`: Chụp màn hình Desktop thực tế\n"
+                    "• `/sysinfo`: Báo cáo CPU, RAM, Ổ đĩa, Uptime\n"
+                    "• `/lock`: Khóa máy tính tức thì\n"
+                    "• `/cmd <lệnh>`: Thực thi lệnh PowerShell nhanh\n\n"
                     "📸 **Gửi ảnh**: Gửi ảnh bất kỳ để nạp thẳng vào IDE làm việc!"
                 )
                 send_telegram(chat_id, help_text, msg_id)
                 continue
 
-            # --- 3. Lệnh /projects ---
+            # --- 3. Lệnh /screen (Chụp màn hình Desktop) ---
+            if cmd in ["/screen", "/screenshot", "screen", "screenshot", "chụp màn hình", "chupmanhinh", "/chupmanhinh"]:
+                send_telegram_chat_action(chat_id, "upload_photo")
+                img_path = os.path.join(config.RECEIVED_IMAGES_DIR, f"screen_{int(time.time())}.jpg")
+                try:
+                    w, h = capture_screen_gdi(img_path)
+                    now_str = datetime.datetime.now().strftime("%H:%M:%S %d/%m/%Y")
+                    caption = f"🖥️ *Ảnh chụp màn hình PC*\n• *Thời gian:* `{now_str}`\n• *Độ phân giải:* `{w}x{h}`"
+                    send_telegram_photo(chat_id, img_path, caption, msg_id)
+                except Exception as e:
+                    logger.error(f"Screenshot error: {e}", exc_info=True)
+                    send_telegram(chat_id, f"❌ Lỗi khi chụp màn hình PC: {e}", msg_id)
+                continue
+
+            # --- 4. Lệnh /sysinfo (Thông số phần cứng) ---
+            if cmd in ["/sysinfo", "/pc", "sysinfo", "pc", "thông số", "thong so", "/status_pc", "cấu hình", "cau hinh"]:
+                send_telegram_chat_action(chat_id, "typing")
+                try:
+                    report = get_system_hardware_info()
+                    send_telegram(chat_id, report, msg_id)
+                except Exception as e:
+                    send_telegram(chat_id, f"❌ Lỗi lấy thông số PC: {e}", msg_id)
+                continue
+
+            # --- 5. Lệnh /lock (Khóa màn hình máy tính) ---
+            if cmd in ["/lock", "lock", "khóa máy", "khoa may", "/khoa"]:
+                ok = lock_windows_workstation()
+                if ok:
+                    send_telegram(chat_id, "🔒 **ĐÃ KHÓA MÀN HÌNH MÁY TÍNH (WINDOWS LOCK) THÀNH CÔNG!**", msg_id)
+                else:
+                    send_telegram(chat_id, "⚠️ Không thể khóa màn hình máy tính.", msg_id)
+                continue
+
+            # --- 6. Lệnh /cmd <lệnh> (Chạy lệnh shell/powershell trực tiếp) ---
+            if raw.startswith("/cmd ") or raw.startswith("/ps ") or raw.startswith("/terminal "):
+                cmd_to_run = raw.split(" ", 1)[1].strip()
+                if not cmd_to_run:
+                    send_telegram(chat_id, "⚠️ Vui lòng nhập lệnh sau `/cmd`. Ví dụ: `/cmd Get-Process python`", msg_id)
+                    continue
+                send_telegram(chat_id, f"⚡ Đang chạy lệnh trên PC: `{cmd_to_run}`...", msg_id)
+                send_telegram_chat_action(chat_id, "typing")
+                res = execute_system_cmd(cmd_to_run)
+                send_telegram(chat_id, res, msg_id)
+                continue
+
+            # --- 7. Lệnh /projects ---
             if cmd in ["/projects", "/project", "projects", "du an", "dự án", "/duan"]:
                 await show_projects_menu(chat_id, msg_id)
                 continue
 
-            # --- 4. Lệnh /chats ---
+            # --- 8. Lệnh /chats ---
             if cmd in ["/chats", "/tasks", "chats", "tasks", "doan chat", "đoạn chat"]:
                 await show_all_chats_menu(chat_id, msg_id)
                 continue
 
-            # --- 5. Lệnh /stop ---
+            # --- 9. Lệnh /stop ---
             if cmd in ["/stop", "stop", "dừng", "dung", "cancel", "/cancel"]:
                 ok, err = await stop_task()
                 if ok:
@@ -871,7 +1201,7 @@ async def worker_loop():
                     send_telegram(chat_id, f"⚠️ Không có tác vụ nào đang chạy hoặc không thể dừng: {err}", msg_id)
                 continue
 
-            # --- 6. Lệnh /new ---
+            # --- 10. Lệnh /new ---
             if cmd in ["/new", "new", "mới", "moi", "/newchat"]:
                 ok, err = await new_conversation()
                 if ok:
@@ -880,7 +1210,7 @@ async def worker_loop():
                     send_telegram(chat_id, f"⚠️ Lỗi khi mở đoạn chat mới: {err}", msg_id)
                 continue
 
-            # --- 7. Lệnh /current ---
+            # --- 11. Lệnh /current ---
             if cmd in ["/current", "/status", "status", "hien tai", "hiện tại"]:
                 curr_cid = await get_current_conversation_id()
                 active = get_active_project()
@@ -898,7 +1228,7 @@ async def worker_loop():
                 send_telegram(chat_id, msg, msg_id)
                 continue
 
-            # --- 8. Điều hướng số (1, 2, 3...) khi đang xem Menu ---
+            # --- 12. Điều hướng số (1, 2, 3...) khi đang xem Menu ---
             if raw.isdigit() and chat_id in user_nav_context:
                 idx = int(raw) - 1
                 ctx = user_nav_context[chat_id]
@@ -912,7 +1242,23 @@ async def worker_loop():
                         await do_switch_conversation(chat_id, item, msg_id)
                         continue
 
-            # --- 9. Gửi lệnh / prompt trực tiếp vào Antigravity IDE ---
+            # --- 13. Xử lý MỞ NHIỀU ĐOẠN HỘI THOẠI SONG SONG (/multi hoặc phân cách ---) ---
+            is_explicit_multi = raw.startswith("/multi") or raw.startswith("/spawn") or raw.startswith("/batch")
+            sub_text = raw
+            if is_explicit_multi:
+                # Bỏ prefix lệnh
+                parts = raw.split("\n", 1)
+                sub_text = parts[1].strip() if len(parts) > 1 else ""
+
+            commands_list = parse_multi_commands(sub_text) if sub_text else []
+            if (is_explicit_multi and commands_list) or len(commands_list) >= 2:
+                if len(commands_list) == 1 and not is_explicit_multi:
+                    pass
+                else:
+                    await execute_multi_conversations(chat_id, commands_list, msg_id)
+                    continue
+
+            # --- 14. Gửi lệnh / prompt đơn lẻ trực tiếp vào đoạn chat hiện tại trên IDE ---
             curr_cid = await get_current_conversation_id()
             t_file, last_step = get_latest_transcript_info(curr_cid)
             
