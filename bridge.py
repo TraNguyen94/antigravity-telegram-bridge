@@ -270,6 +270,101 @@ def execute_system_cmd(command_str):
     except Exception as e:
         return f"❌ Lỗi thực thi lệnh: {e}"
 
+def ensure_single_instance():
+    """Đảm bảo chỉ có DUY NHẤT một tiến trình python bridge.py chạy trên máy tính, tránh lỗi HTTP 409 Conflict."""
+    current_pid = os.getpid()
+    parent_pid = os.getppid() if hasattr(os, "getppid") else None
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            p_name = (proc.info.get('name') or '').lower()
+            if proc.info['pid'] not in [current_pid, parent_pid] and p_name in ['python.exe', 'pythonw.exe']:
+                cmdline = " ".join(proc.info.get('cmdline') or []).lower()
+                if ("bridge.py" in cmdline or "antigravity_bridge.py" in cmdline) and "-c" not in cmdline:
+                    logger.info(f"Terminating old/duplicate bridge process PID: {proc.info['pid']}")
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+def wait_for_internet(timeout=300, check_interval=3):
+    """Vòng lặp kiểm tra kết nối mạng khi khởi động máy. Tự động tiếp tục ngay khi có mạng."""
+    logger.info("Checking internet connectivity...")
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        for host, port in [("8.8.8.8", 53), ("1.1.1.1", 53), ("api.telegram.org", 443)]:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(2.5)
+                s.connect((host, port))
+                s.close()
+                logger.info(f"Internet connection verified via {host}:{port}")
+                return True
+            except Exception:
+                pass
+        logger.info(f"Waiting for network connection... ({int(time.time() - start_time)}s)")
+        time.sleep(check_interval)
+    logger.warning("Internet wait timeout reached.")
+    return False
+
+def is_antigravity_running():
+    for proc in psutil.process_iter(['name']):
+        try:
+            if 'antigravity' in (proc.info.get('name') or '').lower():
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    return False
+
+def ensure_antigravity_running():
+    """Kiểm tra và tự động khởi động Google Antigravity IDE nếu chưa mở."""
+    if is_antigravity_running():
+        logger.info("Antigravity IDE is already running.")
+        return True
+    
+    exe_candidates = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "antigravity" / "Antigravity.exe",
+        Path("C:/Users/PC/AppData/Local/Programs/antigravity/Antigravity.exe")
+    ]
+    for exe in exe_candidates:
+        if exe.exists():
+            logger.info(f"Auto-launching Antigravity IDE: {exe}")
+            try:
+                subprocess.Popen([str(exe)], shell=False)
+                for _ in range(15):
+                    time.sleep(1)
+                    port = get_devtools_active_port()
+                    if port:
+                        logger.info(f"Antigravity IDE started successfully with DevTools port: {port}")
+                        time.sleep(2)
+                        return True
+                return True
+            except Exception as e:
+                logger.error(f"Error launching Antigravity IDE: {e}")
+    logger.warning("Could not find Antigravity.exe to launch.")
+    return False
+
+def notify_startup(port):
+    """Gửi tin nhắn Telegram thông báo máy tính đã bật và kết nối mạng thành công."""
+    now_str = datetime.datetime.now().strftime("%H:%M:%S %d/%m/%Y")
+    hostname = socket.gethostname()
+    msg = (
+        f"🚀 *ĐẠI CA TÚ ƠI! MÁY TÍNH ĐÃ KHỞI ĐỘNG & KẾT NỐI MẠNG THÀNH CÔNG!*\n\n"
+        f"• *Thời gian:* `{now_str}`\n"
+        f"• *Tên máy:* `{hostname}`\n"
+        f"• *Google Antigravity IDE:* Đã sẵn sàng (Cổng `{port or 'Auto'}`) 🟢\n"
+        f"• *Bot gác cổng:* `@tructra_hermes_pc_bot` đang ôm súng trực chiến 24/7!\n\n"
+        f"👉 Đại Ca có thể gửi lệnh hoặc ảnh từ xa bất kỳ lúc nào!"
+    )
+    for uid in config.ALLOWED_USER_IDS:
+        try:
+            send_telegram(uid, msg)
+        except Exception as e:
+            logger.warning(f"Could not send startup greeting to {uid}: {e}")
+
+
 # -------------------------------------------------------------
 # Antigravity DevTools (CDP) Auto-Detection & Control
 # -------------------------------------------------------------
@@ -1285,7 +1380,16 @@ async def worker_loop():
 async def main():
     logger.info("=== Antigravity Direct Telegram Bridge Started ===")
     
-    # 1. Detect CDP Port & Tab
+    # 0. Đảm bảo chỉ 1 tiến trình duy nhất chạy
+    ensure_single_instance()
+    
+    # 1. Chờ kết nối mạng (Internet) sẵn sàng
+    wait_for_internet()
+    
+    # 2. Đảm bảo Google Antigravity IDE đang chạy
+    ensure_antigravity_running()
+    
+    # 3. Detect CDP Port & Tab
     cdp_url = detect_cdp_url()
     tab = get_active_tab()
     if tab:
@@ -1293,13 +1397,17 @@ async def main():
     else:
         logger.warning(f"Could not connect to Antigravity at {cdp_url}. Please ensure Antigravity IDE is running.")
         
-    # 2. Register Telegram slash commands
+    # 4. Register Telegram slash commands
     register_telegram_commands()
     
-    # 3. Start worker
+    # 5. Gửi thông báo chào mừng & báo cáo sẵn sàng đến Telegram của Đại Ca
+    active_port = get_devtools_active_port()
+    notify_startup(active_port)
+    
+    # 6. Start worker
     asyncio.create_task(worker_loop())
     
-    # 4. Long-polling
+    # 7. Long-polling
     offset = None
     poll_url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/getUpdates"
     
@@ -1386,6 +1494,8 @@ async def main():
                 await asyncio.sleep(2)
         except Exception as e:
             logger.error(f"Polling loop error: {e}")
+            if "getaddrinfo" in str(e).lower() or "network" in str(e).lower() or "timed out" in str(e).lower():
+                wait_for_internet(timeout=180, check_interval=5)
             await asyncio.sleep(2)
 
 if __name__ == "__main__":
